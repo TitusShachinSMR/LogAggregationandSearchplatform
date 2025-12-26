@@ -9,7 +9,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 TENANTS = [
     "tenant_project_auth",
     "tenant_project_payments",
-    "tenant_project_users"
+    "6720833e-6eaf-4b5d-b0a4-28c6ea99142b"
 ]
 
 SERVICES = ["auth-service", "payment-service", "user-service"]
@@ -27,4 +27,4 @@ while True:
     r.xadd("logs_stream", log)
     print("Produced:", log)
 
-    time.sleep(1)
+    time.sleep(3)

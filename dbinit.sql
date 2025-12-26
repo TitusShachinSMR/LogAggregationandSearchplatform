@@ -31,7 +31,7 @@ CREATE TABLE user_organizations (
 -- =========================
 CREATE TABLE projects (
     id SERIAL PRIMARY KEY,
-    org_id INT REFERENCES organizations(id) ON DELETE CASCADE,
+    owner_id INT REFERENCES users(id) ON DELETE CASCADE,
     project_name TEXT NOT NULL,
     tenant_id TEXT UNIQUE NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -54,4 +54,5 @@ CREATE TABLE logs (
 -- =========================
 CREATE INDEX idx_logs_tenant ON logs(tenant_id);
 CREATE INDEX idx_logs_level ON logs(level);
+CREATE INDEX idx_logs_service ON logs(service);
 CREATE INDEX idx_logs_timestamp ON logs(timestamp);
