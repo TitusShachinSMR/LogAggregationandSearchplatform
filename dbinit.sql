@@ -5,6 +5,7 @@ CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
     email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -52,7 +53,7 @@ CREATE TABLE logs (
 -- =========================
 -- INDEXES (important)
 -- =========================
-CREATE INDEX idx_logs_tenant ON logs(tenant_id);
-CREATE INDEX idx_logs_level ON logs(level);
-CREATE INDEX idx_logs_service ON logs(service);
+CREATE INDEX idx_logs_tenant    ON logs(tenant_id);
+CREATE INDEX idx_logs_level     ON logs(level);
+CREATE INDEX idx_logs_service   ON logs(service);
 CREATE INDEX idx_logs_timestamp ON logs(timestamp);

@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN pip install fastapi uvicorn psycopg2-binary
+RUN pip install fastapi uvicorn psycopg2-binary bcrypt
 
 COPY api.py .
 

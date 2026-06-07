@@ -16,16 +16,36 @@ services:
       - "5432:5432"
     volumes:
       - ./dbinit.sql:/docker-entrypoint-initdb.d/dbinit.sql
+      - pgdata:/var/lib/postgresql/data
 
-  producer:
-    build: ./producer
-    container_name: producer
+  fluent-bit:
+    build: ./fluent-bit
+    container_name: fluent-bit
+    env_file: .env
+    ports:
+      - "24224:24224"
     depends_on:
-      - redis
+      - api
+
+  # -------------------------------------------
+  # Dummy app — simulates a friend's application
+  # Logs JSON to stdout, Docker ships it to Fluent Bit
+  # -------------------------------------------
+  dummy-app:
+    build: ./dummy-app
+    container_name: dummy-app
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "localhost:24224"
+        tag: "dummy-app"
+    depends_on:
+      - fluent-bit
 
   consumer:
     build: ./consumer
     container_name: consumer
+    env_file: .env
     depends_on:
       - redis
       - postgres
@@ -33,6 +53,7 @@ services:
   api:
     build: ./api
     container_name: api
+    env_file: .env
     ports:
       - "8000:8000"
     depends_on:

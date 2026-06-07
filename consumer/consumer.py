@@ -1,11 +1,16 @@
 import redis
 import psycopg2
 import time
+import os
 
 # -------------------------
 # Redis connection
 # -------------------------
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+r = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    decode_responses=True
+)
 
 # -------------------------
 # Wait for Postgres
@@ -13,10 +18,10 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 while True:
     try:
         conn = psycopg2.connect(
-            host="postgres",
-            database="logsdb",
-            user="logsuser",
-            password="logspass"
+            host=os.getenv("POSTGRES_HOST", "postgres"),
+            database=os.getenv("POSTGRES_DB", "logsdb"),
+            user=os.getenv("POSTGRES_USER", "logsuser"),
+            password=os.getenv("POSTGRES_PASSWORD", "logspass")
         )
         break
     except psycopg2.OperationalError:
