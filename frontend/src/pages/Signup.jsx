@@ -20,7 +20,7 @@ export default function Signup() {
         email: form.email,
         password: form.password,
       })
-      login({ user_id: data.user_id, username: data.username })
+      login({ user_id: data.user_id, username: data.username, token: data.token })
       navigate('/dashboard')
     } catch (err) {
       setError(err.response?.data?.detail || 'Signup failed')

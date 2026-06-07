@@ -1,11 +1,38 @@
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import psycopg2
 import bcrypt
+import jwt
+import redis as redis_client
 import time
 import uuid
 import os
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
+
+JWT_SECRET      = os.getenv("JWT_SECRET", "dev-secret")
+JWT_ALGORITHM   = "HS256"
+JWT_EXPIRY_HRS  = int(os.getenv("JWT_EXPIRY_HOURS", 24))
+
+bearer_scheme = HTTPBearer()
+
+def create_token(user_id: int, username: str) -> str:
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HRS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> dict:
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 app = FastAPI(
     title="Log Aggregation & Search Platform",
@@ -29,6 +56,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -------------------------
+# Postgres
+# -------------------------
 DB_CONFIG = dict(
     host=os.getenv("POSTGRES_HOST", "postgres"),
     database=os.getenv("POSTGRES_DB", "logsdb"),
@@ -52,11 +82,29 @@ print("API connected to Postgres")
 def get_conn():
     global conn
     try:
-        # ping — raises if connection is dead
         conn.isolation_level
     except Exception:
         conn = psycopg2.connect(**DB_CONFIG)
     return conn
+
+
+# -------------------------
+# Redis
+# -------------------------
+r = redis_client.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    decode_responses=True,
+)
+
+def push_to_stream(tenant_id: str, service: str, level: str, message: str, timestamp: str = None):
+    r.xadd("logs_stream", {
+        "tenant_id": tenant_id,
+        "service":   service or "",
+        "level":     level or "INFO",
+        "message":   message,
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # -------------------------
@@ -101,7 +149,8 @@ def signup(body: SignupRequest):
             c.rollback()
             raise HTTPException(status_code=400, detail="Username or email already exists")
 
-    return {"user_id": user_id, "username": body.username}
+    token = create_token(user_id, body.username)
+    return {"user_id": user_id, "username": body.username, "token": token}
 
 
 @app.post("/auth/login", tags=["Auth"], summary="Login with username + password")
@@ -117,7 +166,8 @@ def login(body: LoginRequest):
     if not row or not bcrypt.checkpw(body.password.encode(), row[1].encode()):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    return {"user_id": row[0], "username": body.username}
+    token = create_token(row[0], body.username)
+    return {"user_id": row[0], "username": body.username, "token": token}
 
 
 # ===========================
@@ -125,7 +175,7 @@ def login(body: LoginRequest):
 # ===========================
 
 @app.post("/projects", tags=["Projects"], summary="Create a project — returns tenant_id", status_code=201)
-def create_project(project: ProjectCreate):
+def create_project(project: ProjectCreate, _: dict = Depends(verify_token)):
     tenant_id = str(uuid.uuid4())
     c = get_conn()
     with c.cursor() as cur:
@@ -143,7 +193,7 @@ def create_project(project: ProjectCreate):
 
 
 @app.get("/users/{user_id}/projects", tags=["Projects"], summary="List all projects for a user")
-def get_projects(user_id: int):
+def get_projects(user_id: int, _: dict = Depends(verify_token)):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute(
@@ -159,7 +209,7 @@ def get_projects(user_id: int):
 
 
 @app.delete("/projects/{project_id}", tags=["Projects"], summary="Delete a project and all its logs")
-def delete_project(project_id: int, user_id: int):
+def delete_project(project_id: int, user_id: int, _: dict = Depends(verify_token)):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("SELECT tenant_id, owner_id FROM projects WHERE id = %s", (project_id,))
@@ -178,7 +228,7 @@ def delete_project(project_id: int, user_id: int):
 
 
 # ===========================
-# Fluent Bit ingestion
+# Fluent Bit ingestion (no auth — internal only)
 # ===========================
 
 @app.post("/ingest", tags=["Logs"], summary="Internal — receives log batches from Fluent Bit")
@@ -186,34 +236,23 @@ async def ingest_from_fluentbit(request: Request):
     body = await request.json()
     records = body if isinstance(body, list) else [body]
 
-    inserted = 0
-    c = get_conn()
-    with c.cursor() as cur:
-        for record in records:
-            tenant_id = record.get("tenant_id")
-            service   = record.get("service")
-            level     = record.get("level")
-            message   = record.get("message")
-            timestamp = record.get("timestamp")
+    queued = 0
+    for record in records:
+        tenant_id = record.get("tenant_id")
+        message   = record.get("message")
+        if not tenant_id or not message:
+            continue
+        push_to_stream(
+            tenant_id = tenant_id,
+            service   = record.get("service", ""),
+            level     = record.get("level", "INFO"),
+            message   = message,
+            timestamp = record.get("timestamp"),
+        )
+        queued += 1
 
-            if not tenant_id or not message:
-                continue
-
-            if timestamp:
-                cur.execute(
-                    "INSERT INTO logs (tenant_id, service, level, message, timestamp) VALUES (%s, %s, %s, %s, %s::timestamptz)",
-                    (tenant_id, service, level, message, timestamp)
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO logs (tenant_id, service, level, message) VALUES (%s, %s, %s, %s)",
-                    (tenant_id, service, level, message)
-                )
-            inserted += 1
-        c.commit()
-
-    print(f"[/ingest] inserted {inserted} log(s)")
-    return {"inserted": inserted}
+    print(f"[/ingest] queued {queued} log(s) to Redis")
+    return {"queued": queued}
 
 
 # ===========================
@@ -224,18 +263,24 @@ async def ingest_from_fluentbit(request: Request):
 def ingest_log(
     log: LogCreate,
     x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
 ):
-    c = get_conn()
-    with c.cursor() as cur:
-        cur.execute(
-            "INSERT INTO logs (tenant_id, service, level, message) VALUES (%s, %s, %s, %s) RETURNING id, timestamp",
-            (x_tenant_id, log.service, log.level, log.message)
-        )
-        row = cur.fetchone()
-        c.commit()
-
-    return {"id": row[0], "tenant_id": x_tenant_id, "service": log.service,
-            "level": log.level, "message": log.message, "timestamp": row[1]}
+    ts = datetime.now(timezone.utc).isoformat()
+    push_to_stream(
+        tenant_id = x_tenant_id,
+        service   = log.service,
+        level     = log.level,
+        message   = log.message,
+        timestamp = ts,
+    )
+    return {
+        "queued":    True,
+        "tenant_id": x_tenant_id,
+        "service":   log.service,
+        "level":     log.level,
+        "message":   log.message,
+        "timestamp": ts,
+    }
 
 
 @app.get("/logs", tags=["Logs"], summary="List recent logs")
@@ -244,6 +289,7 @@ def get_logs(
     level: str | None = None,
     service: str | None = None,
     limit: int = 50,
+    _: dict = Depends(verify_token),
 ):
     query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = %s"
     params = [x_tenant_id]
@@ -270,6 +316,7 @@ def search_logs(
     start_time: str | None = None,
     end_time: str | None = None,
     limit: int = 100,
+    _: dict = Depends(verify_token),
 ):
     query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = %s"
     params = [x_tenant_id]
@@ -298,7 +345,10 @@ def search_logs(
 # ===========================
 
 @app.get("/analytics/summary", tags=["Analytics"], summary="Total, error, and warning counts")
-def summary(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"])):
+def summary(
+    x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
+):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("""
@@ -310,7 +360,10 @@ def summary(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-
 
 
 @app.get("/analytics/by-service", tags=["Analytics"], summary="Log count grouped by service")
-def logs_by_service(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"])):
+def logs_by_service(
+    x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
+):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("""
@@ -321,7 +374,10 @@ def logs_by_service(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples
 
 
 @app.get("/analytics/by-level", tags=["Analytics"], summary="Log count grouped by level")
-def logs_by_level(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"])):
+def logs_by_level(
+    x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
+):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("SELECT level, COUNT(*) FROM logs WHERE tenant_id = %s GROUP BY level", (x_tenant_id,))
@@ -330,7 +386,10 @@ def logs_by_level(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=[
 
 
 @app.get("/analytics/logs-per-day", tags=["Analytics"], summary="Log count per calendar day")
-def logs_per_day(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"])):
+def logs_per_day(
+    x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
+):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("""
@@ -344,6 +403,7 @@ def logs_per_day(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["
 def day_breakdown(
     x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
     date: str = None,
+    _: dict = Depends(verify_token),
 ):
     if not date:
         raise HTTPException(status_code=400, detail="date query param required (YYYY-MM-DD)")
@@ -362,18 +422,19 @@ def day_breakdown(
         """, (x_tenant_id, date))
         rows = cur.fetchall()
 
-    # Build hour buckets 0-23 with INFO/WARN/ERROR counts
     buckets = {h: {"hour": h, "INFO": 0, "WARN": 0, "ERROR": 0} for h in range(24)}
     for hour, level, count in rows:
         if level in buckets[hour]:
             buckets[hour][level] = count
 
-    # Only return hours that had any activity
     return [b for b in buckets.values() if b["INFO"] + b["WARN"] + b["ERROR"] > 0]
 
 
 @app.get("/analytics/error-trend", tags=["Analytics"], summary="ERROR count per hour over time")
-def error_trend(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"])):
+def error_trend(
+    x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
+    _: dict = Depends(verify_token),
+):
     c = get_conn()
     with c.cursor() as cur:
         cur.execute("""
@@ -389,6 +450,7 @@ def error_trend(x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["y
 def top_error_services(
     x_tenant_id: str = Header(..., alias="X-Tenant-ID", examples=["your-tenant-uuid"]),
     limit: int = 5,
+    _: dict = Depends(verify_token),
 ):
     c = get_conn()
     with c.cursor() as cur:
