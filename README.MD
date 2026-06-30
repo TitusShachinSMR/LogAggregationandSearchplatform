@@ -311,6 +311,252 @@ requests.post("http://your-platform:8000/logs",
 
 ---
 
+## Interview Reference — Express.js Equivalent
+
+> This project uses FastAPI (Python). The equivalent in Express.js (Node.js) is shown below for interview use — syntax is simpler and more universally recognized.
+
+### FastAPI vs Express — Key Differences
+
+| Thing | FastAPI (Python) | Express (Node.js) |
+|---|---|---|
+| Route decorator | `@app.get("/path")` | `app.get("/path", handler)` |
+| Auth middleware | `Depends(verify_token)` | `verifyToken` as middle argument |
+| Request body | Pydantic model auto-parsed | `req.body` (needs `express.json()`) |
+| Query params | Function params with defaults | `req.query.param` |
+| Path params | `{user_id}` in path | `:user_id` → `req.params.user_id` |
+| Headers | `Header(..., alias="X-Tenant-ID")` | `req.headers["x-tenant-id"]` |
+| DB placeholders | `%s` (psycopg2) | `$1, $2` (pg Pool) |
+| Error response | `raise HTTPException(404, ...)` | `return res.status(404).json(...)` |
+| Async | `async def` + `await` | `async (req, res) =>` + `await` |
+
+### Express.js Implementation
+
+```js
+const express = require("express");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+const { v4: uuidv4 } = require("uuid");
+
+const app = express();
+app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+
+// -------------------------
+// DB Connection
+// -------------------------
+const pool = new Pool({
+  host: process.env.POSTGRES_HOST || "localhost",
+  database: process.env.POSTGRES_DB || "logsdb",
+  user: process.env.POSTGRES_USER || "logsuser",
+  password: process.env.POSTGRES_PASSWORD || "logspass",
+});
+
+// -------------------------
+// Auth Middleware
+// -------------------------
+function verifyToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader) return res.status(401).json({ detail: "No token" });
+
+  const token = authHeader.split(" ")[1]; // "Bearer <token>"
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ detail: "Invalid or expired token" });
+  }
+}
+
+// ===========================
+// Auth
+// ===========================
+
+// POST /auth/signup
+app.post("/auth/signup", async (req, res) => {
+  const { username, email, password } = req.body;
+  const password_hash = await bcrypt.hash(password, 10);
+  try {
+    const result = await pool.query(
+      "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id",
+      [username, email, password_hash]
+    );
+    const user_id = result.rows[0].id;
+    const token = jwt.sign({ sub: user_id, username }, JWT_SECRET, { expiresIn: "24h" });
+    res.status(201).json({ user_id, username, token });
+  } catch (err) {
+    res.status(400).json({ detail: "Username or email already exists" });
+  }
+});
+
+// POST /auth/login
+app.post("/auth/login", async (req, res) => {
+  const { username, password } = req.body;
+  const result = await pool.query(
+    "SELECT id, password_hash FROM users WHERE username = $1",
+    [username]
+  );
+  const user = result.rows[0];
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    return res.status(401).json({ detail: "Invalid username or password" });
+  }
+  const token = jwt.sign({ sub: user.id, username }, JWT_SECRET, { expiresIn: "24h" });
+  res.json({ user_id: user.id, username, token });
+});
+
+// ===========================
+// Projects
+// ===========================
+
+// POST /projects
+app.post("/projects", verifyToken, async (req, res) => {
+  const { name, user_id } = req.body;
+  const tenant_id = uuidv4();
+  const userCheck = await pool.query("SELECT id FROM users WHERE id = $1", [user_id]);
+  if (!userCheck.rows[0]) return res.status(404).json({ detail: "User not found" });
+  const result = await pool.query(
+    "INSERT INTO projects (project_name, tenant_id, owner_id) VALUES ($1, $2, $3) RETURNING id",
+    [name, tenant_id, user_id]
+  );
+  res.status(201).json({ project_id: result.rows[0].id, project_name: name, tenant_id });
+});
+
+// GET /users/:user_id/projects
+app.get("/users/:user_id/projects", verifyToken, async (req, res) => {
+  const { user_id } = req.params;
+  const result = await pool.query(
+    "SELECT id, project_name, tenant_id, created_at FROM projects WHERE owner_id = $1 ORDER BY created_at DESC",
+    [user_id]
+  );
+  res.json(result.rows);
+});
+
+// DELETE /projects/:project_id
+app.delete("/projects/:project_id", verifyToken, async (req, res) => {
+  const { project_id } = req.params;
+  const { user_id } = req.query;
+  const result = await pool.query(
+    "SELECT tenant_id, owner_id FROM projects WHERE id = $1", [project_id]
+  );
+  const project = result.rows[0];
+  if (!project) return res.status(404).json({ detail: "Project not found" });
+  if (project.owner_id != user_id) return res.status(403).json({ detail: "Not your project" });
+  await pool.query("DELETE FROM logs WHERE tenant_id = $1", [project.tenant_id]);
+  await pool.query("DELETE FROM projects WHERE id = $1", [project_id]);
+  res.json({ deleted: true, project_id });
+});
+
+// ===========================
+// Logs
+// ===========================
+
+// POST /logs
+app.post("/logs", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const { service, level, message } = req.body;
+  const timestamp = new Date().toISOString();
+  await pool.query(
+    "INSERT INTO logs (tenant_id, service, level, message, timestamp) VALUES ($1, $2, $3, $4, $5)",
+    [tenant_id, service, level, message, timestamp]
+  );
+  res.status(201).json({ queued: true, tenant_id, service, level, message, timestamp });
+});
+
+// GET /logs
+app.get("/logs", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const { level, service, limit = 50 } = req.query;
+  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = $1";
+  const params = [tenant_id];
+  if (level)   { params.push(level);   query += ` AND level = $${params.length}`; }
+  if (service) { params.push(service); query += ` AND service = $${params.length}`; }
+  params.push(limit); query += ` ORDER BY timestamp DESC LIMIT $${params.length}`;
+  const result = await pool.query(query, params);
+  res.json(result.rows);
+});
+
+// GET /logs/search
+app.get("/logs/search", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const { keyword, level, service, start_time, end_time, limit = 100 } = req.query;
+  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = $1";
+  const params = [tenant_id];
+  if (keyword)    { params.push(`%${keyword}%`); query += ` AND message ILIKE $${params.length}`; }
+  if (level)      { params.push(level);          query += ` AND level = $${params.length}`; }
+  if (service)    { params.push(service);        query += ` AND service = $${params.length}`; }
+  if (start_time) { params.push(start_time);     query += ` AND timestamp >= $${params.length}`; }
+  if (end_time)   { params.push(end_time);       query += ` AND timestamp <= $${params.length}`; }
+  params.push(limit); query += ` ORDER BY timestamp DESC LIMIT $${params.length}`;
+  const result = await pool.query(query, params);
+  res.json(result.rows);
+});
+
+// ===========================
+// Analytics
+// ===========================
+
+// GET /analytics/summary
+app.get("/analytics/summary", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const result = await pool.query(
+    `SELECT COUNT(*),
+            COUNT(*) FILTER (WHERE level='ERROR'),
+            COUNT(*) FILTER (WHERE level='WARN')
+     FROM logs WHERE tenant_id = $1`,
+    [tenant_id]
+  );
+  const row = result.rows[0];
+  res.json({ total_logs: row.count, error_logs: row.count, warning_logs: row.count });
+});
+
+// GET /analytics/by-service
+app.get("/analytics/by-service", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const result = await pool.query(
+    "SELECT service, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY service ORDER BY COUNT(*) DESC",
+    [tenant_id]
+  );
+  res.json(result.rows);
+});
+
+// GET /analytics/by-level
+app.get("/analytics/by-level", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const result = await pool.query(
+    "SELECT level, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY level",
+    [tenant_id]
+  );
+  res.json(result.rows);
+});
+
+// GET /analytics/logs-per-day
+app.get("/analytics/logs-per-day", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const result = await pool.query(
+    "SELECT DATE(timestamp) AS day, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY day ORDER BY day",
+    [tenant_id]
+  );
+  res.json(result.rows);
+});
+
+// GET /analytics/error-trend
+app.get("/analytics/error-trend", verifyToken, async (req, res) => {
+  const tenant_id = req.headers["x-tenant-id"];
+  const result = await pool.query(
+    `SELECT DATE_TRUNC('hour', timestamp) AS hour, COUNT(*)
+     FROM logs WHERE tenant_id = $1 AND level = 'ERROR'
+     GROUP BY hour ORDER BY hour`,
+    [tenant_id]
+  );
+  res.json(result.rows);
+});
+
+app.listen(3000, () => console.log("API running on port 3000"));
+```
+
+---
+
 ## What You'd Do Differently at Scale
 
 | Current | Production |
