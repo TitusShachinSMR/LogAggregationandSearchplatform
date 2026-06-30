@@ -149,16 +149,57 @@ Only `/auth/signup`, `/auth/login`, and `/ingest` are public. Everything else re
 ## Database Schema
 
 ```sql
-users (id, username, email, password_hash, created_at)
-projects (id, owner_id → users, project_name, tenant_id UUID, created_at)
-logs (id, tenant_id, service, level, message, timestamp)
-organizations, user_organizations  ← for future org-level grouping
+-- USERS
+CREATE TABLE users (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    username      VARCHAR(100) UNIQUE NOT NULL,
+    email         VARCHAR(150) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ORGANIZATIONS
+CREATE TABLE organizations (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(100) UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- USER <-> ORGANIZATION (many-to-many)
+CREATE TABLE user_organizations (
+    user_id INT,
+    org_id  INT,
+    PRIMARY KEY (user_id, org_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (org_id)  REFERENCES organizations(id) ON DELETE CASCADE
+);
+
+-- PROJECTS (1 project = 1 tenant)
+CREATE TABLE projects (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    owner_id     INT,
+    project_name VARCHAR(150) NOT NULL,
+    tenant_id    VARCHAR(100) UNIQUE NOT NULL,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- LOGS (tenant-scoped)
+CREATE TABLE logs (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    tenant_id VARCHAR(100) NOT NULL,
+    service   VARCHAR(100),
+    level     VARCHAR(20),
+    message   TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES projects(tenant_id) ON DELETE CASCADE
+);
 
 -- Indexes for fast queries
-idx_logs_tenant    ON logs(tenant_id)
-idx_logs_level     ON logs(level)
-idx_logs_service   ON logs(service)
-idx_logs_timestamp ON logs(timestamp)
+CREATE INDEX idx_logs_tenant    ON logs(tenant_id);
+CREATE INDEX idx_logs_level     ON logs(level);
+CREATE INDEX idx_logs_service   ON logs(service);
+CREATE INDEX idx_logs_timestamp ON logs(timestamp);
 ```
 
 ---
@@ -313,7 +354,7 @@ requests.post("http://your-platform:8000/logs",
 
 ## Interview Reference — Express.js Equivalent
 
-> This project uses FastAPI (Python). The equivalent in Express.js (Node.js) is shown below for interview use — syntax is simpler and more universally recognized.
+> This project uses FastAPI + PostgreSQL. For interviews, the equivalent in Express.js + MySQL is shown below — simpler syntax, more universally recognized.
 
 ### FastAPI vs Express — Key Differences
 
@@ -325,17 +366,28 @@ requests.post("http://your-platform:8000/logs",
 | Query params | Function params with defaults | `req.query.param` |
 | Path params | `{user_id}` in path | `:user_id` → `req.params.user_id` |
 | Headers | `Header(..., alias="X-Tenant-ID")` | `req.headers["x-tenant-id"]` |
-| DB placeholders | `%s` (psycopg2) | `$1, $2` (pg Pool) |
+| DB placeholders | `%s` (psycopg2 / PostgreSQL) | `?` (mysql2) |
 | Error response | `raise HTTPException(404, ...)` | `return res.status(404).json(...)` |
 | Async | `async def` + `await` | `async (req, res) =>` + `await` |
 
-### Express.js Implementation
+### PostgreSQL vs MySQL — Query Differences
+
+| Feature | PostgreSQL | MySQL |
+|---|---|---|
+| Placeholders | `$1, $2, $3` | `?, ?, ?` |
+| Get inserted ID | `RETURNING id` | `result.insertId` |
+| Case-insensitive search | `ILIKE '%keyword%'` | `LIKE '%keyword%'` (case-insensitive by default) |
+| Conditional count | `COUNT(*) FILTER (WHERE level='ERROR')` | `SUM(level = 'ERROR')` |
+| Truncate to hour | `DATE_TRUNC('hour', timestamp)` | `DATE_FORMAT(timestamp, '%Y-%m-%d %H:00:00')` |
+| Auto-increment | `SERIAL` | `INT AUTO_INCREMENT` |
+
+### Express.js + MySQL Implementation
 
 ```js
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const { Pool } = require("pg");
+const mysql = require("mysql2/promise");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
@@ -346,11 +398,11 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 // -------------------------
 // DB Connection
 // -------------------------
-const pool = new Pool({
-  host: process.env.POSTGRES_HOST || "localhost",
-  database: process.env.POSTGRES_DB || "logsdb",
-  user: process.env.POSTGRES_USER || "logsuser",
-  password: process.env.POSTGRES_PASSWORD || "logspass",
+const pool = mysql.createPool({
+  host:     process.env.MYSQL_HOST     || "localhost",
+  database: process.env.MYSQL_DB       || "logsdb",
+  user:     process.env.MYSQL_USER     || "logsuser",
+  password: process.env.MYSQL_PASSWORD || "logspass",
 });
 
 // -------------------------
@@ -378,11 +430,11 @@ app.post("/auth/signup", async (req, res) => {
   const { username, email, password } = req.body;
   const password_hash = await bcrypt.hash(password, 10);
   try {
-    const result = await pool.query(
-      "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id",
+    const [result] = await pool.query(
+      "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
       [username, email, password_hash]
     );
-    const user_id = result.rows[0].id;
+    const user_id = result.insertId;
     const token = jwt.sign({ sub: user_id, username }, JWT_SECRET, { expiresIn: "24h" });
     res.status(201).json({ user_id, username, token });
   } catch (err) {
@@ -393,11 +445,11 @@ app.post("/auth/signup", async (req, res) => {
 // POST /auth/login
 app.post("/auth/login", async (req, res) => {
   const { username, password } = req.body;
-  const result = await pool.query(
-    "SELECT id, password_hash FROM users WHERE username = $1",
+  const [rows] = await pool.query(
+    "SELECT id, password_hash FROM users WHERE username = ?",
     [username]
   );
-  const user = result.rows[0];
+  const user = rows[0];
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ detail: "Invalid username or password" });
   }
@@ -413,37 +465,37 @@ app.post("/auth/login", async (req, res) => {
 app.post("/projects", verifyToken, async (req, res) => {
   const { name, user_id } = req.body;
   const tenant_id = uuidv4();
-  const userCheck = await pool.query("SELECT id FROM users WHERE id = $1", [user_id]);
-  if (!userCheck.rows[0]) return res.status(404).json({ detail: "User not found" });
-  const result = await pool.query(
-    "INSERT INTO projects (project_name, tenant_id, owner_id) VALUES ($1, $2, $3) RETURNING id",
+  const [userCheck] = await pool.query("SELECT id FROM users WHERE id = ?", [user_id]);
+  if (!userCheck[0]) return res.status(404).json({ detail: "User not found" });
+  const [result] = await pool.query(
+    "INSERT INTO projects (project_name, tenant_id, owner_id) VALUES (?, ?, ?)",
     [name, tenant_id, user_id]
   );
-  res.status(201).json({ project_id: result.rows[0].id, project_name: name, tenant_id });
+  res.status(201).json({ project_id: result.insertId, project_name: name, tenant_id });
 });
 
 // GET /users/:user_id/projects
 app.get("/users/:user_id/projects", verifyToken, async (req, res) => {
   const { user_id } = req.params;
-  const result = await pool.query(
-    "SELECT id, project_name, tenant_id, created_at FROM projects WHERE owner_id = $1 ORDER BY created_at DESC",
+  const [rows] = await pool.query(
+    "SELECT id, project_name, tenant_id, created_at FROM projects WHERE owner_id = ? ORDER BY created_at DESC",
     [user_id]
   );
-  res.json(result.rows);
+  res.json(rows);
 });
 
 // DELETE /projects/:project_id
 app.delete("/projects/:project_id", verifyToken, async (req, res) => {
   const { project_id } = req.params;
   const { user_id } = req.query;
-  const result = await pool.query(
-    "SELECT tenant_id, owner_id FROM projects WHERE id = $1", [project_id]
+  const [rows] = await pool.query(
+    "SELECT tenant_id, owner_id FROM projects WHERE id = ?", [project_id]
   );
-  const project = result.rows[0];
+  const project = rows[0];
   if (!project) return res.status(404).json({ detail: "Project not found" });
   if (project.owner_id != user_id) return res.status(403).json({ detail: "Not your project" });
-  await pool.query("DELETE FROM logs WHERE tenant_id = $1", [project.tenant_id]);
-  await pool.query("DELETE FROM projects WHERE id = $1", [project_id]);
+  await pool.query("DELETE FROM logs WHERE tenant_id = ?", [project.tenant_id]);
+  await pool.query("DELETE FROM projects WHERE id = ?", [project_id]);
   res.json({ deleted: true, project_id });
 });
 
@@ -455,9 +507,9 @@ app.delete("/projects/:project_id", verifyToken, async (req, res) => {
 app.post("/logs", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
   const { service, level, message } = req.body;
-  const timestamp = new Date().toISOString();
+  const timestamp = new Date().toISOString().slice(0, 19).replace("T", " ");
   await pool.query(
-    "INSERT INTO logs (tenant_id, service, level, message, timestamp) VALUES ($1, $2, $3, $4, $5)",
+    "INSERT INTO logs (tenant_id, service, level, message, timestamp) VALUES (?, ?, ?, ?, ?)",
     [tenant_id, service, level, message, timestamp]
   );
   res.status(201).json({ queued: true, tenant_id, service, level, message, timestamp });
@@ -467,29 +519,29 @@ app.post("/logs", verifyToken, async (req, res) => {
 app.get("/logs", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
   const { level, service, limit = 50 } = req.query;
-  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = $1";
+  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = ?";
   const params = [tenant_id];
-  if (level)   { params.push(level);   query += ` AND level = $${params.length}`; }
-  if (service) { params.push(service); query += ` AND service = $${params.length}`; }
-  params.push(limit); query += ` ORDER BY timestamp DESC LIMIT $${params.length}`;
-  const result = await pool.query(query, params);
-  res.json(result.rows);
+  if (level)   { params.push(level);   query += " AND level = ?"; }
+  if (service) { params.push(service); query += " AND service = ?"; }
+  params.push(Number(limit)); query += " ORDER BY timestamp DESC LIMIT ?";
+  const [rows] = await pool.query(query, params);
+  res.json(rows);
 });
 
 // GET /logs/search
 app.get("/logs/search", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
   const { keyword, level, service, start_time, end_time, limit = 100 } = req.query;
-  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = $1";
+  let query = "SELECT service, level, message, timestamp FROM logs WHERE tenant_id = ?";
   const params = [tenant_id];
-  if (keyword)    { params.push(`%${keyword}%`); query += ` AND message ILIKE $${params.length}`; }
-  if (level)      { params.push(level);          query += ` AND level = $${params.length}`; }
-  if (service)    { params.push(service);        query += ` AND service = $${params.length}`; }
-  if (start_time) { params.push(start_time);     query += ` AND timestamp >= $${params.length}`; }
-  if (end_time)   { params.push(end_time);       query += ` AND timestamp <= $${params.length}`; }
-  params.push(limit); query += ` ORDER BY timestamp DESC LIMIT $${params.length}`;
-  const result = await pool.query(query, params);
-  res.json(result.rows);
+  if (keyword)    { params.push(`%${keyword}%`); query += " AND message LIKE ?"; }
+  if (level)      { params.push(level);          query += " AND level = ?"; }
+  if (service)    { params.push(service);        query += " AND service = ?"; }
+  if (start_time) { params.push(start_time);     query += " AND timestamp >= ?"; }
+  if (end_time)   { params.push(end_time);       query += " AND timestamp <= ?"; }
+  params.push(Number(limit)); query += " ORDER BY timestamp DESC LIMIT ?";
+  const [rows] = await pool.query(query, params);
+  res.json(rows);
 });
 
 // ===========================
@@ -499,57 +551,57 @@ app.get("/logs/search", verifyToken, async (req, res) => {
 // GET /analytics/summary
 app.get("/analytics/summary", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
-  const result = await pool.query(
-    `SELECT COUNT(*),
-            COUNT(*) FILTER (WHERE level='ERROR'),
-            COUNT(*) FILTER (WHERE level='WARN')
-     FROM logs WHERE tenant_id = $1`,
+  const [rows] = await pool.query(
+    `SELECT
+       COUNT(*)                      AS total_logs,
+       SUM(level = 'ERROR')          AS error_logs,
+       SUM(level = 'WARN')           AS warning_logs
+     FROM logs WHERE tenant_id = ?`,
     [tenant_id]
   );
-  const row = result.rows[0];
-  res.json({ total_logs: row.count, error_logs: row.count, warning_logs: row.count });
+  res.json(rows[0]);
 });
 
 // GET /analytics/by-service
 app.get("/analytics/by-service", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
-  const result = await pool.query(
-    "SELECT service, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY service ORDER BY COUNT(*) DESC",
+  const [rows] = await pool.query(
+    "SELECT service, COUNT(*) AS count FROM logs WHERE tenant_id = ? GROUP BY service ORDER BY count DESC",
     [tenant_id]
   );
-  res.json(result.rows);
+  res.json(rows);
 });
 
 // GET /analytics/by-level
 app.get("/analytics/by-level", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
-  const result = await pool.query(
-    "SELECT level, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY level",
+  const [rows] = await pool.query(
+    "SELECT level, COUNT(*) AS count FROM logs WHERE tenant_id = ? GROUP BY level",
     [tenant_id]
   );
-  res.json(result.rows);
+  res.json(rows);
 });
 
 // GET /analytics/logs-per-day
 app.get("/analytics/logs-per-day", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
-  const result = await pool.query(
-    "SELECT DATE(timestamp) AS day, COUNT(*) FROM logs WHERE tenant_id = $1 GROUP BY day ORDER BY day",
+  const [rows] = await pool.query(
+    "SELECT DATE(timestamp) AS day, COUNT(*) AS count FROM logs WHERE tenant_id = ? GROUP BY day ORDER BY day",
     [tenant_id]
   );
-  res.json(result.rows);
+  res.json(rows);
 });
 
 // GET /analytics/error-trend
 app.get("/analytics/error-trend", verifyToken, async (req, res) => {
   const tenant_id = req.headers["x-tenant-id"];
-  const result = await pool.query(
-    `SELECT DATE_TRUNC('hour', timestamp) AS hour, COUNT(*)
-     FROM logs WHERE tenant_id = $1 AND level = 'ERROR'
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(timestamp, '%Y-%m-%d %H:00:00') AS hour, COUNT(*) AS count
+     FROM logs WHERE tenant_id = ? AND level = 'ERROR'
      GROUP BY hour ORDER BY hour`,
     [tenant_id]
   );
-  res.json(result.rows);
+  res.json(rows);
 });
 
 app.listen(3000, () => console.log("API running on port 3000"));
